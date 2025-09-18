@@ -21,33 +21,20 @@ const WebSocket = require('ws');
 const amqp = require('amqplib');
 const winston = require('winston');
 
-// Winston JSON 로깅 설정 - Datadog 필터링 테스트용
+// 간략한 JSON 로깅 설정
 const logger = winston.createLogger({
-  level: 'debug',
+  level: 'info',
   format: winston.format.combine(
     winston.format.timestamp(),
     winston.format.errors({ stack: true }),
     winston.format.json(),
     winston.format.printf(({ timestamp, level, message, ...meta }) => {
-      // Datadog 필터링 테스트용 더미 데이터 자동 추가
       const logEntry = {
         timestamp,
         level,
         service: 'chat-node',
         message,
-        ...meta,
-
-        // 실제 운영 데이터는 meta에서 가져옴
-        // 테스트용 더미 데이터 (Datadog에서 제외할 필드들)
-        sensitive_info: {
-          internal_token: 'sk-chat-' + Math.random().toString(36).substr(2, 10),
-          debug_session: 'sess_' + Date.now()
-        },
-        system_metrics: {
-          memory_mb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
-          uptime_sec: Math.round(process.uptime()),
-          active_handles: process._getActiveHandles().length
-        }
+        ...meta
       };
       return JSON.stringify(logEntry);
     })
@@ -119,10 +106,7 @@ function broadcastUserList() {
 
   try {
     globalChannel.publish(EX, RK, Buffer.from(userListMessage));
-    logger.debug('사용자 목록 브로드캐스트!!', {
-      total_users: userList.length,
-      user_ids: userList.map(u => u.userId)
-    });
+    logger.info('사용자 목록 업데이트', { total_users: userList.length });
   } catch (error) {
     logger.error('사용자 목록 브로드캐스트 실패', { error: error.message });
   }
@@ -208,11 +192,6 @@ async function connectWithRetry() {
 
             // user_join 메시지는 사용자 등록만 하고 채팅 메시지로는 브로드캐스트하지 않음
             if (msg.type === 'user_join') {
-              logger.debug('사용자 입장 메시지 처리 완료', {
-                connection_id: connectionId,
-                user_id: userName,
-                total_users: connectedUsers.size
-              });
               return; // 채팅 메시지 브로드캐스트 건너뛰기
             }
 
@@ -226,13 +205,6 @@ async function connectWithRetry() {
 
             // RabbitMQ를 통해 모든 연결된 클라이언트에게 브로드캐스트
             globalChannel.publish(EX, RK, Buffer.from(payload));
-
-            logger.info('채팅 메시지 전송', {
-              connection_id: connectionId,
-              user_id: userName,
-              message_length: msg.text?.length || 0,
-              total_clients: wss.clients.size
-            });
           } catch (e) {
             logger.error('메시지 발송 에러', {
               connection_id: connectionId,
@@ -321,8 +293,8 @@ async function connectWithRetry() {
           ws.ping();
         });
 
-        if (wss.clients.size > 0) {
-          logger.debug('Keep-alive ping 전송', {
+        if (terminatedCount > 0) {
+          logger.info('Keep-alive 체크 완료', {
             total_connections: wss.clients.size,
             terminated_connections: terminatedCount
           });
@@ -337,11 +309,13 @@ async function connectWithRetry() {
           openConnections.forEach(c => c.send(JSON.stringify(data)));
           ch.ack(m);
 
-          logger.debug('RabbitMQ 메시지 브로드캐스트', {
-            message_user: data.user,
-            broadcast_count: openConnections.length,
-            total_clients: wss.clients.size
-          });
+          // 채팅 메시지만 로그 기록 (사용자 목록 업데이트 제외)
+          if (data.type === 'chat') {
+            logger.info('채팅 메시지 브로드캐스트', {
+              user: data.user,
+              clients: openConnections.length
+            });
+          }
         } catch (error) {
           logger.error('RabbitMQ 메시지 처리 에러', {
             error: error.message,
