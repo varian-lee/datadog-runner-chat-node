@@ -113,7 +113,8 @@ function broadcastUserList() {
 }
 
 // RabbitMQ 설정 - 메시지 브로드캐스팅을 위한 Exchange/Queue
-const EX = 'chat.exchange', Q = 'chat.messages', RK = 'chat.msg';
+// 각 Pod가 고유한 Queue를 가져야 fanout exchange가 제대로 작동함
+const EX = 'chat.exchange', RK = 'chat.msg';
 
 async function connectWithRetry() {
   const maxRetries = 10;
@@ -134,12 +135,16 @@ async function connectWithRetry() {
       globalChannel = ch;
 
       await ch.assertExchange(EX, 'fanout', { durable: false });
-      const q = await ch.assertQueue(Q, { durable: false });
+
+      // 각 Pod가 고유한 익명 큐를 생성 (이름 없음, exclusive=true, auto-delete=true)
+      // Fanout exchange는 연결된 모든 큐에 메시지를 브로드캐스트함
+      const q = await ch.assertQueue('', { exclusive: true, autoDelete: true });
       await ch.bindQueue(q.queue, EX, '');
 
       logger.info('RabbitMQ 연결 성공!', {
         exchange: EX,
-        queue: Q,
+        queue: q.queue,  // 자동 생성된 고유한 큐 이름
+        queue_type: 'exclusive_anonymous',
         routing_key: RK
       });
 
