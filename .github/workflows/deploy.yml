@@ -1,0 +1,145 @@
+# ============================================================================
+# 🚀 Chat Node - 배포 워크플로우
+# ============================================================================
+
+name: 🚀 Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: '배포 환경'
+        required: true
+        type: choice
+        default: 'demo'
+        options:
+          - demo
+          - staging
+          - production
+
+  push:
+    branches:
+      - main
+    paths:
+      - '*.js'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'Dockerfile'
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_REPOSITORY: datadog-runner/chat-node
+  EKS_CLUSTER_NAME: datadog-runner-cluster
+  SERVICE_NAME: chat-node
+  DD_SITE: datadoghq.com
+
+jobs:
+  build-and-deploy:
+    name: 🏗️ Build & Deploy
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 📋 Set deployment info
+        id: info
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          VERSION="dev-${TIMESTAMP}-${SHORT_SHA}"
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "started_at=$(date +%s%N)" >> $GITHUB_OUTPUT
+
+      - name: 🔐 Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: github-actions-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🔑 Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: 🐳 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 🔨 Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.info.outputs.version }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 🔧 Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: 🔗 Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }}
+
+      - name: 🚀 Deploy to EKS
+        id: deploy
+        run: |
+          IMAGE="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.info.outputs.version }}"
+          kubectl set image deployment/${{ env.SERVICE_NAME }} ${{ env.SERVICE_NAME }}=$IMAGE
+          kubectl rollout status deployment/${{ env.SERVICE_NAME }} --timeout=300s
+          echo "finished_at=$(date +%s%N)" >> $GITHUB_OUTPUT
+
+      - name: 📊 Verify deployment
+        run: |
+          kubectl get deployment ${{ env.SERVICE_NAME }} -o wide
+          kubectl get pods -l app=${{ env.SERVICE_NAME }}
+
+      - name: 📈 Send DORA Metrics
+        if: always()
+        run: |
+          curl -s -X POST "https://api.${{ env.DD_SITE }}/api/v2/dora/deployment" \
+            -H "DD-API-KEY: ${{ secrets.DD_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "data": {
+                "attributes": {
+                  "started_at": ${{ steps.info.outputs.started_at }},
+                  "finished_at": ${{ steps.deploy.outputs.finished_at || 0 }},
+                  "service": "${{ env.SERVICE_NAME }}",
+                  "version": "${{ steps.info.outputs.version }}",
+                  "env": "${{ github.event.inputs.environment || 'demo' }}"
+                }
+              }
+            }' || true
+
+      - name: 📢 Slack Notification
+        if: always()
+        uses: slackapi/slack-github-action@v1.25.0
+        continue-on-error: true
+        with:
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '✅' || '❌' }} ${{ env.SERVICE_NAME }} 배포 ${{ job.status == 'success' && '성공' || '실패' }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
