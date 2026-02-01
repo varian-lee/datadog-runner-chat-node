@@ -137,7 +137,7 @@ jobs:
         with:
           payload: |
             {
-              "text": "${{ job.status == 'success' && '✅' || '❌' }} ${{ env.SERVICE_NAME }} 배포 ${{ job.status == 'success' && '성공' || '실패' }}"
+              "text": "${{ job.status == 'success' && '✅' || '❌' }} ${{ env.SERVICE_NAME }} 배포 ${{ job.status == 'success' && '성공' || '실패' }} - v${{ steps.info.outputs.version }}"
             }
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
