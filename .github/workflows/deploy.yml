@@ -61,6 +61,22 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
           echo "started_at=$(date +%s%N)" >> $GITHUB_OUTPUT
+          echo "started_at_unix=$(date +%s)" >> $GITHUB_OUTPUT
+          
+          # 커밋 정보 수집 (여러 커밋일 경우 모두 포함)
+          COMMITS_JSON='${{ toJSON(github.event.commits) }}'
+          if [ "$COMMITS_JSON" != "null" ] && [ "$COMMITS_JSON" != "[]" ]; then
+            COMMIT_INFO=$(echo '${{ toJSON(github.event.commits) }}' | jq -r '.[] | "• \(.author.username // .author.name): \(.message | split("\n")[0])"' | head -5)
+            COMMIT_COUNT=$(echo '${{ toJSON(github.event.commits) }}' | jq '. | length')
+          else
+            COMMIT_INFO="• ${{ github.actor }}: ${{ github.event.head_commit.message || 'Manual trigger' }}"
+            COMMIT_COUNT=1
+          fi
+          
+          echo "commit_info<<EOF" >> $GITHUB_OUTPUT
+          echo "$COMMIT_INFO" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
 
       - name: 🔐 Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -130,6 +146,17 @@ jobs:
               }
             }' || true
 
+      - name: 📊 Calculate duration
+        if: always()
+        id: duration
+        run: |
+          START=${{ steps.info.outputs.started_at_unix }}
+          END=$(date +%s)
+          DURATION=$((END - START))
+          MINUTES=$((DURATION / 60))
+          SECONDS=$((DURATION % 60))
+          echo "text=${MINUTES}분 ${SECONDS}초" >> $GITHUB_OUTPUT
+
       - name: 📢 Slack Notification
         if: always()
         uses: slackapi/slack-github-action@v1.25.0
@@ -137,7 +164,47 @@ jobs:
         with:
           payload: |
             {
-              "text": "${{ job.status == 'success' && '✅' || '❌' }} ${{ env.SERVICE_NAME }} 배포 ${{ job.status == 'success' && '성공' || '실패' }} - v${{ steps.info.outputs.version }}"
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${{ job.status == 'success' && '✅ 배포 성공' || '❌ 배포 실패' }} - ${{ env.SERVICE_NAME }}",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {"type": "mrkdwn", "text": "*버전:*\n`${{ steps.info.outputs.version }}`"},
+                    {"type": "mrkdwn", "text": "*환경:*\n`${{ github.event.inputs.environment || 'demo' }}`"},
+                    {"type": "mrkdwn", "text": "*브랜치:*\n`${{ github.ref_name }}`"},
+                    {"type": "mrkdwn", "text": "*소요시간:*\n${{ steps.duration.outputs.text }}"}
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*📝 커밋 (${{ steps.info.outputs.commit_count }}개):*\n${{ steps.info.outputs.commit_info }}"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "🔗 커밋 보기", "emoji": true},
+                      "url": "${{ github.event.head_commit.url || format('{0}/commit/{1}', github.server_url, github.sha) }}"
+                    },
+                    {
+                      "type": "button",
+                      "text": {"type": "plain_text", "text": "📋 Actions 로그", "emoji": true},
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
             }
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
