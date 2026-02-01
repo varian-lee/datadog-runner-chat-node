@@ -1,0 +1,196 @@
+# ============================================================================
+# 🐶 Datadog Runner - Datadog 모니터링 체크 워크플로우
+# ============================================================================
+# 기능:
+#   - 배포 후 Datadog 모니터 상태 확인
+#   - 에러율/응답시간 체크
+#   - 문제 발생 시 자동 롤백 (선택)
+# ============================================================================
+
+name: 🐶 Datadog Health Check
+
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: '체크할 서비스'
+        required: true
+        type: choice
+        options:
+          - auth-python
+          - chat-node
+          - ranking-java
+          - frontend-react
+          - api-gateway
+          - all
+      auto_rollback:
+        description: '문제 시 자동 롤백'
+        type: boolean
+        default: false
+
+  # 다른 워크플로우에서 호출
+  workflow_call:
+    inputs:
+      service:
+        required: true
+        type: string
+      auto_rollback:
+        required: false
+        type: boolean
+        default: false
+
+env:
+  DD_SITE: datadoghq.com
+
+jobs:
+  check-monitors:
+    name: 🔍 Check Datadog Monitors
+    runs-on: ubuntu-latest
+    outputs:
+      has_alerts: ${{ steps.check.outputs.has_alerts }}
+      alert_count: ${{ steps.check.outputs.alert_count }}
+    steps:
+      - name: 📋 Check info
+        run: |
+          echo "🐶 Datadog 모니터 상태 확인"
+          echo "   서비스: ${{ inputs.service }}"
+          echo "   자동 롤백: ${{ inputs.auto_rollback }}"
+
+      - name: 🔍 Check monitor status
+        id: check
+        run: |
+          SERVICE="${{ inputs.service }}"
+          
+          # Datadog API로 모니터 상태 조회
+          if [ "$SERVICE" == "all" ]; then
+            QUERY="env:demo"
+          else
+            QUERY="service:$SERVICE env:demo"
+          fi
+          
+          echo "📊 모니터 조회 중: $QUERY"
+          
+          RESPONSE=$(curl -s -X GET \
+            "https://api.${{ env.DD_SITE }}/api/v1/monitor" \
+            -H "Accept: application/json" \
+            -H "DD-API-KEY: ${{ secrets.DD_API_KEY }}" \
+            -H "DD-APPLICATION-KEY: ${{ secrets.DD_APP_KEY }}" \
+            -G --data-urlencode "monitor_tags=$QUERY")
+          
+          # Alert 상태인 모니터 수 확인
+          ALERT_COUNT=$(echo "$RESPONSE" | jq '[.[] | select(.overall_state == "Alert")] | length')
+          
+          echo "alert_count=$ALERT_COUNT" >> $GITHUB_OUTPUT
+          
+          if [ "$ALERT_COUNT" -gt 0 ]; then
+            echo "has_alerts=true" >> $GITHUB_OUTPUT
+            echo "⚠️ $ALERT_COUNT개의 모니터가 Alert 상태입니다!"
+            
+            # Alert 모니터 상세 정보 출력
+            echo ""
+            echo "=== Alert 모니터 목록 ==="
+            echo "$RESPONSE" | jq -r '.[] | select(.overall_state == "Alert") | "- \(.name): \(.overall_state)"'
+          else
+            echo "has_alerts=false" >> $GITHUB_OUTPUT
+            echo "✅ 모든 모니터가 정상 상태입니다."
+          fi
+
+      - name: 📊 Check APM metrics
+        run: |
+          SERVICE="${{ inputs.service }}"
+          
+          if [ "$SERVICE" == "all" ]; then
+            echo "전체 서비스 메트릭 확인은 건너뜁니다."
+            exit 0
+          fi
+          
+          echo "📊 $SERVICE APM 메트릭 확인 중..."
+          
+          # 최근 5분간 에러율 조회
+          NOW=$(date +%s)
+          FROM=$((NOW - 300))
+          
+          RESPONSE=$(curl -s -X GET \
+            "https://api.${{ env.DD_SITE }}/api/v1/query" \
+            -H "DD-API-KEY: ${{ secrets.DD_API_KEY }}" \
+            -H "DD-APPLICATION-KEY: ${{ secrets.DD_APP_KEY }}" \
+            -G --data-urlencode "from=$FROM" \
+            --data-urlencode "to=$NOW" \
+            --data-urlencode "query=sum:trace.http.request.errors{service:$SERVICE,env:demo}.as_count()")
+          
+          ERROR_COUNT=$(echo "$RESPONSE" | jq '.series[0].pointlist[-1][1] // 0')
+          
+          echo "최근 5분간 에러 수: $ERROR_COUNT"
+          
+          if [ "$(echo "$ERROR_COUNT > 10" | bc)" -eq 1 ]; then
+            echo "⚠️ 에러율이 높습니다!"
+          else
+            echo "✅ 에러율 정상"
+          fi
+
+  # ========================================
+  # 자동 롤백 (Alert 발생 시)
+  # ========================================
+  auto-rollback:
+    name: ⏪ Auto Rollback
+    needs: check-monitors
+    if: needs.check-monitors.outputs.has_alerts == 'true' && inputs.auto_rollback == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: ⚠️ Alert detected
+        run: |
+          echo "⚠️ ${{ needs.check-monitors.outputs.alert_count }}개의 Alert 발견!"
+          echo "자동 롤백을 시작합니다..."
+
+      - name: ⏪ Trigger rollback
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'rollback.yml',
+              ref: 'main',
+              inputs: {
+                service: '${{ inputs.service }}',
+                rollback_type: 'previous',
+                reason: '자동 롤백: Datadog Alert 감지'
+              }
+            });
+            console.log('롤백 워크플로우 트리거 완료');
+
+  # ========================================
+  # 결과 보고
+  # ========================================
+  report:
+    name: 📊 Report
+    needs: [check-monitors, auto-rollback]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📊 Generate report
+        run: |
+          echo "# 🐶 Datadog 상태 체크 결과" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 항목 | 결과 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 서비스 | ${{ inputs.service }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Alert 수 | ${{ needs.check-monitors.outputs.alert_count }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 상태 | ${{ needs.check-monitors.outputs.has_alerts == 'true' && '⚠️ Alert' || '✅ 정상' }} |" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.auto-rollback.result }}" == "success" ]; then
+            echo "| 자동 롤백 | ✅ 실행됨 |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: 📢 Slack Notification
+        if: needs.check-monitors.outputs.has_alerts == 'true'
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "⚠️ Datadog Alert 감지: ${{ inputs.service }} (${{ needs.check-monitors.outputs.alert_count }}개)"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+

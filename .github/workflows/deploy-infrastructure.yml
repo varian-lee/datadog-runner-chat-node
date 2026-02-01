@@ -1,0 +1,141 @@
+# ============================================================================
+# 🏗️ Datadog Runner - 인프라 서비스 배포 워크플로우
+# ============================================================================
+# 기능:
+#   - PostgreSQL, Redis, RabbitMQ 배포
+#   - 인프라 서비스 헬스체크
+#   - 데이터베이스 초기화 (선택)
+# ============================================================================
+
+name: 🏗️ Deploy Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      services:
+        description: '배포할 인프라 서비스'
+        required: true
+        type: choice
+        default: 'all'
+        options:
+          - all
+          - postgres
+          - redis
+          - rabbitmq
+      init_database:
+        description: '데이터베이스 초기화 (주의!)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: ap-northeast-2
+  EKS_CLUSTER_NAME: datadog-runner-cluster
+
+jobs:
+  deploy-infrastructure:
+    name: 🏗️ Deploy Infrastructure
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🔐 Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: github-actions-infra
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🔧 Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: 🔗 Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }}
+
+      # ========================================
+      # PostgreSQL 배포
+      # ========================================
+      - name: 🐘 Deploy PostgreSQL
+        if: github.event.inputs.services == 'all' || github.event.inputs.services == 'postgres'
+        run: |
+          echo "🐘 PostgreSQL 배포 중..."
+          kubectl apply -f infra/infra/k8s/postgres.yaml
+          
+          echo "⏳ PostgreSQL 준비 대기 중..."
+          kubectl wait --for=condition=ready pod -l app=postgres --timeout=300s
+          
+          echo "✅ PostgreSQL 배포 완료!"
+
+      - name: 🔧 Initialize Database
+        if: (github.event.inputs.services == 'all' || github.event.inputs.services == 'postgres') && github.event.inputs.init_database == 'true'
+        run: |
+          echo "⚠️ 데이터베이스 초기화 중..."
+          
+          # Pod 이름 가져오기
+          POD=$(kubectl get pod -l app=postgres -o jsonpath='{.items[0].metadata.name}')
+          
+          # init.sql 실행
+          kubectl cp infra/sql/init.sql $POD:/tmp/init.sql
+          kubectl exec $POD -- psql -U app -d app -f /tmp/init.sql
+          
+          echo "✅ 데이터베이스 초기화 완료!"
+
+      # ========================================
+      # Redis 배포
+      # ========================================
+      - name: 🔴 Deploy Redis
+        if: github.event.inputs.services == 'all' || github.event.inputs.services == 'redis'
+        run: |
+          echo "🔴 Redis 배포 중..."
+          kubectl apply -f infra/infra/k8s/redis.yaml
+          
+          echo "⏳ Redis 준비 대기 중..."
+          kubectl wait --for=condition=ready pod -l app=redis --timeout=300s
+          
+          echo "✅ Redis 배포 완료!"
+
+      # ========================================
+      # RabbitMQ 배포
+      # ========================================
+      - name: 🐰 Deploy RabbitMQ
+        if: github.event.inputs.services == 'all' || github.event.inputs.services == 'rabbitmq'
+        run: |
+          echo "🐰 RabbitMQ 배포 중..."
+          kubectl apply -f infra/infra/k8s/rabbitmq.yaml
+          
+          echo "⏳ RabbitMQ 준비 대기 중..."
+          kubectl wait --for=condition=ready pod -l app=rabbitmq --timeout=300s
+          
+          echo "✅ RabbitMQ 배포 완료!"
+
+      # ========================================
+      # 상태 확인
+      # ========================================
+      - name: 📊 Verify deployment
+        run: |
+          echo "📊 인프라 서비스 상태:"
+          echo ""
+          echo "=== Pods ==="
+          kubectl get pods -l 'app in (postgres,redis,rabbitmq)'
+          echo ""
+          echo "=== Services ==="
+          kubectl get svc -l 'app in (postgres,redis,rabbitmq)'
+
+      - name: 📢 Slack Notification
+        if: always()
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '✅' || '❌' }} 인프라 서비스 배포 ${{ job.status == 'success' && '성공' || '실패' }}: ${{ github.event.inputs.services }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+

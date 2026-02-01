@@ -1,0 +1,275 @@
+# ============================================================================
+# ⏪ Datadog Runner - 롤백 워크플로우
+# ============================================================================
+# 기능:
+#   - 이전 버전으로 빠른 롤백
+#   - 특정 버전/이미지 태그로 롤백
+#   - Datadog DORA Incident 전송
+# ============================================================================
+
+name: ⏪ Rollback Service
+
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: '롤백할 서비스'
+        required: true
+        type: choice
+        options:
+          - auth-python
+          - chat-node
+          - ranking-java
+          - frontend-react
+          - api-gateway
+          - load-generator
+      rollback_type:
+        description: '롤백 방식'
+        required: true
+        type: choice
+        default: 'previous'
+        options:
+          - previous      # 직전 버전으로 롤백
+          - specific_tag  # 특정 이미지 태그로 롤백
+          - undo          # kubectl rollout undo 사용
+      image_tag:
+        description: '이미지 태그 (specific_tag 선택 시)'
+        required: false
+        type: string
+        default: ''
+      reason:
+        description: '롤백 사유'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_REPOSITORY_PREFIX: datadog-runner
+  EKS_CLUSTER_NAME: datadog-runner-cluster
+  DD_SITE: datadoghq.com
+
+jobs:
+  rollback:
+    name: ⏪ Rollback ${{ github.event.inputs.service }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 📋 Rollback info
+        id: info
+        run: |
+          echo "🔴 롤백 시작"
+          echo "   서비스: ${{ github.event.inputs.service }}"
+          echo "   방식: ${{ github.event.inputs.rollback_type }}"
+          echo "   사유: ${{ github.event.inputs.reason }}"
+          echo ""
+          
+          # 롤백 시작 시간
+          echo "started_at=$(date +%s%N)" >> $GITHUB_OUTPUT
+
+      # ========================================
+      # AWS 인증
+      # ========================================
+      - name: 🔐 Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: github-actions-rollback-${{ github.event.inputs.service }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🔑 Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: 🔧 Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: 🔗 Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }}
+
+      # ========================================
+      # 현재 상태 저장
+      # ========================================
+      - name: 📊 Get current deployment info
+        id: current
+        run: |
+          SERVICE="${{ github.event.inputs.service }}"
+          
+          # 현재 이미지 태그 저장
+          CURRENT_IMAGE=$(kubectl get deployment $SERVICE -o jsonpath='{.spec.template.spec.containers[0].image}')
+          echo "current_image=$CURRENT_IMAGE" >> $GITHUB_OUTPUT
+          
+          # 현재 레플리카 수
+          REPLICAS=$(kubectl get deployment $SERVICE -o jsonpath='{.spec.replicas}')
+          echo "replicas=$REPLICAS" >> $GITHUB_OUTPUT
+          
+          echo "📋 현재 배포 상태:"
+          echo "   이미지: $CURRENT_IMAGE"
+          echo "   레플리카: $REPLICAS"
+
+      # ========================================
+      # 롤백 실행
+      # ========================================
+      - name: ⏪ Execute rollback
+        id: rollback
+        run: |
+          SERVICE="${{ github.event.inputs.service }}"
+          ROLLBACK_TYPE="${{ github.event.inputs.rollback_type }}"
+          
+          case "$ROLLBACK_TYPE" in
+            "undo")
+              echo "🔄 kubectl rollout undo 실행..."
+              kubectl rollout undo deployment/$SERVICE
+              TARGET_IMAGE=$(kubectl get deployment $SERVICE -o jsonpath='{.spec.template.spec.containers[0].image}')
+              ;;
+              
+            "previous")
+              echo "🔄 직전 ReplicaSet 이미지로 롤백..."
+              # 직전 ReplicaSet에서 이미지 가져오기
+              PREVIOUS_RS=$(kubectl get rs -l app=$SERVICE --sort-by='.metadata.creationTimestamp' -o jsonpath='{.items[-2].metadata.name}')
+              if [ -z "$PREVIOUS_RS" ]; then
+                echo "❌ 직전 ReplicaSet을 찾을 수 없습니다."
+                exit 1
+              fi
+              TARGET_IMAGE=$(kubectl get rs $PREVIOUS_RS -o jsonpath='{.spec.template.spec.containers[0].image}')
+              echo "직전 ReplicaSet: $PREVIOUS_RS"
+              echo "롤백 이미지: $TARGET_IMAGE"
+              kubectl set image deployment/$SERVICE $SERVICE=$TARGET_IMAGE
+              ;;
+              
+            "specific_tag")
+              IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+              if [ -z "$IMAGE_TAG" ]; then
+                echo "❌ 이미지 태그가 지정되지 않았습니다."
+                exit 1
+              fi
+              ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+              TARGET_IMAGE="${ECR_REGISTRY}/${{ env.ECR_REPOSITORY_PREFIX }}/$SERVICE:$IMAGE_TAG"
+              echo "🔄 특정 태그로 롤백: $TARGET_IMAGE"
+              kubectl set image deployment/$SERVICE $SERVICE=$TARGET_IMAGE
+              ;;
+          esac
+          
+          echo "target_image=$TARGET_IMAGE" >> $GITHUB_OUTPUT
+          
+          echo "⏳ 롤백 완료 대기 중..."
+          kubectl rollout status deployment/$SERVICE --timeout=300s
+          
+          echo "✅ 롤백 완료!"
+          echo "finished_at=$(date +%s%N)" >> $GITHUB_OUTPUT
+
+      - name: 📊 Verify rollback
+        run: |
+          SERVICE="${{ github.event.inputs.service }}"
+          
+          echo "📊 롤백 후 상태:"
+          kubectl get deployment $SERVICE -o wide
+          echo ""
+          echo "🔍 Pod 상태:"
+          kubectl get pods -l app=$SERVICE
+
+      # ========================================
+      # Datadog DORA Incident 전송
+      # ========================================
+      - name: 📈 Send Datadog DORA Incident
+        run: |
+          echo "📊 Datadog DORA Incident 전송 중..."
+          
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+            "https://api.${{ env.DD_SITE }}/api/v2/dora/incident" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -H "DD-API-KEY: ${{ secrets.DD_API_KEY }}" \
+            -d @- << EOF
+          {
+            "data": {
+              "attributes": {
+                "started_at": ${{ steps.info.outputs.started_at }},
+                "finished_at": ${{ steps.rollback.outputs.finished_at }},
+                "severity": "medium",
+                "service": "${{ github.event.inputs.service }}",
+                "env": "demo",
+                "name": "Rollback: ${{ github.event.inputs.service }}",
+                "git": {
+                  "repository_url": "https://github.com/${{ github.repository }}"
+                }
+              }
+            }
+          }
+          EOF
+          )
+          
+          HTTP_STATUS=$(echo "$RESPONSE" | grep "HTTP_STATUS" | cut -d: -f2)
+          
+          if [[ "$HTTP_STATUS" == "200" ]] || [[ "$HTTP_STATUS" == "201" ]] || [[ "$HTTP_STATUS" == "202" ]]; then
+            echo "✅ DORA Incident 전송 성공!"
+          else
+            echo "⚠️ DORA Incident 전송 실패 (HTTP: $HTTP_STATUS)"
+          fi
+
+      # ========================================
+      # Slack 알림
+      # ========================================
+      - name: 📢 Slack Notification
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "⏪ ${{ github.event.inputs.service }} 롤백 완료",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*서비스:*\n${{ github.event.inputs.service }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*롤백 방식:*\n${{ github.event.inputs.rollback_type }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*이전 이미지:*\n`${{ steps.current.outputs.current_image }}`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*롤백 이미지:*\n`${{ steps.rollback.outputs.target_image }}`"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*사유:*\n${{ github.event.inputs.reason }}"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "실행자: ${{ github.actor }} | <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|로그 보기>"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+

@@ -1,0 +1,133 @@
+# ============================================================================
+# ⏰ Datadog Runner - 예약 배포 워크플로우
+# ============================================================================
+# 기능:
+#   - 야간 자동 배포 (main 브랜치)
+#   - 정기적인 이미지 재빌드 (보안 패치 적용)
+#   - 주간 전체 서비스 배포
+# ============================================================================
+
+name: ⏰ Scheduled Deploy
+
+on:
+  # 매일 오전 3시 (KST) = UTC 18:00
+  schedule:
+    - cron: '0 18 * * 1-5'  # 평일만
+
+  workflow_dispatch:
+    inputs:
+      deploy_all:
+        description: '모든 서비스 배포'
+        type: boolean
+        default: true
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_REPOSITORY_PREFIX: datadog-runner
+  EKS_CLUSTER_NAME: datadog-runner-cluster
+
+jobs:
+  # ============================================================================
+  # 변경사항 확인
+  # ============================================================================
+  check-changes:
+    name: 🔍 Check for updates
+    runs-on: ubuntu-latest
+    outputs:
+      should_deploy: ${{ steps.check.outputs.should_deploy }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for new commits
+        id: check
+        run: |
+          # 마지막 24시간 내 커밋 확인
+          COMMITS=$(git log --since="24 hours ago" --oneline | wc -l)
+          
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "수동 실행 - 배포 진행"
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+          elif [ "$COMMITS" -gt 0 ]; then
+            echo "새 커밋 발견 ($COMMITS개) - 배포 진행"
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+          else
+            echo "새 커밋 없음 - 배포 건너뜀"
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+          fi
+
+  # ============================================================================
+  # 전체 서비스 배포
+  # ============================================================================
+  deploy-all:
+    name: 🚀 Deploy All Services
+    needs: check-changes
+    if: needs.check-changes.outputs.should_deploy == 'true'
+    uses: ./.github/workflows/deploy-service.yml
+    with:
+      service: all
+      environment: demo
+    secrets: inherit
+
+  # ============================================================================
+  # 헬스체크
+  # ============================================================================
+  health-check:
+    name: 🏥 Health Check
+    needs: deploy-all
+    if: always() && needs.deploy-all.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🔐 Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🔧 Install kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: 🔗 Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }}
+
+      - name: 🏥 Check all services
+        run: |
+          echo "🏥 서비스 헬스체크..."
+          
+          SERVICES=("auth-python" "chat-node" "ranking-java" "frontend" "api-gateway")
+          FAILED=0
+          
+          for SERVICE in "${SERVICES[@]}"; do
+            READY=$(kubectl get deployment $SERVICE -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+            DESIRED=$(kubectl get deployment $SERVICE -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "1")
+            
+            if [ "$READY" == "$DESIRED" ]; then
+              echo "✅ $SERVICE: $READY/$DESIRED Ready"
+            else
+              echo "❌ $SERVICE: $READY/$DESIRED Ready"
+              FAILED=$((FAILED + 1))
+            fi
+          done
+          
+          if [ $FAILED -gt 0 ]; then
+            echo ""
+            echo "⚠️ $FAILED개 서비스가 정상 상태가 아닙니다."
+            exit 1
+          fi
+
+      - name: 📢 Slack Notification
+        if: failure()
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "⚠️ 예약 배포 후 헬스체크 실패! 확인이 필요합니다."
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+

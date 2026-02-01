@@ -1,0 +1,536 @@
+# ============================================================================
+# 🚀 Datadog Runner - 개별 서비스 배포 워크플로우
+# ============================================================================
+# 기능:
+#   - 개별 서비스 선택 배포 (workflow_dispatch)
+#   - Push 시 변경된 서비스 자동 감지 배포
+#   - 멀티아키텍처 Docker 빌드 (amd64 + arm64)
+#   - AWS ECR 푸시 (OIDC 인증)
+#   - EKS 배포 (kubectl)
+#   - Kubernetes 매니페스트 자동 업데이트 (버전 증가, Git 환경변수)
+#   - Datadog DORA Metrics 전송
+#   - Slack 알림
+# ============================================================================
+
+name: 🚀 Deploy Service
+
+on:
+  # 수동 실행 (서비스 선택)
+  workflow_dispatch:
+    inputs:
+      service:
+        description: '배포할 서비스 선택'
+        required: true
+        type: choice
+        options:
+          - auth-python
+          - chat-node
+          - ranking-java
+          - frontend-react
+          - api-gateway
+          - load-generator
+          - all
+      environment:
+        description: '배포 환경'
+        required: true
+        type: choice
+        default: 'demo'
+        options:
+          - demo
+          - staging
+          - production
+      skip_tests:
+        description: '테스트 건너뛰기'
+        required: false
+        type: boolean
+        default: false
+
+  # Push 시 자동 배포 (main/develop 브랜치)
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'auth-python/**'
+      - 'chat-node/**'
+      - 'ranking-java/**'
+      - 'frontend-react/**'
+      - 'api-gateway/**'
+      - 'load-generator/**'
+      - 'infra/infra/k8s/**'
+
+# 동시 실행 방지 (같은 서비스에 대해)
+concurrency:
+  group: deploy-${{ github.event.inputs.service || 'auto' }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_REPOSITORY_PREFIX: datadog-runner
+  EKS_CLUSTER_NAME: datadog-runner-cluster
+  DD_SITE: datadoghq.com
+
+jobs:
+  # ============================================================================
+  # 1️⃣ 변경된 서비스 감지 (Push 이벤트용)
+  # ============================================================================
+  detect-changes:
+    name: 🔍 Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.detect.outputs.services }}
+      has_changes: ${{ steps.detect.outputs.has_changes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed services
+        id: detect
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            # 수동 실행: 선택된 서비스 사용
+            if [ "${{ github.event.inputs.service }}" == "all" ]; then
+              echo 'services=["auth-python","chat-node","ranking-java","frontend-react","api-gateway","load-generator"]' >> $GITHUB_OUTPUT
+            else
+              echo 'services=["${{ github.event.inputs.service }}"]' >> $GITHUB_OUTPUT
+            fi
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            # Push 이벤트: 변경된 파일 감지
+            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
+            SERVICES=()
+            
+            if echo "$CHANGED_FILES" | grep -q "^auth-python/"; then
+              SERVICES+=("auth-python")
+            fi
+            if echo "$CHANGED_FILES" | grep -q "^chat-node/"; then
+              SERVICES+=("chat-node")
+            fi
+            if echo "$CHANGED_FILES" | grep -q "^ranking-java/"; then
+              SERVICES+=("ranking-java")
+            fi
+            if echo "$CHANGED_FILES" | grep -q "^frontend-react/"; then
+              SERVICES+=("frontend-react")
+            fi
+            if echo "$CHANGED_FILES" | grep -q "^api-gateway/"; then
+              SERVICES+=("api-gateway")
+            fi
+            if echo "$CHANGED_FILES" | grep -q "^load-generator/"; then
+              SERVICES+=("load-generator")
+            fi
+            
+            if [ ${#SERVICES[@]} -eq 0 ]; then
+              echo "has_changes=false" >> $GITHUB_OUTPUT
+              echo 'services=[]' >> $GITHUB_OUTPUT
+            else
+              # JSON 배열로 변환
+              JSON_ARRAY=$(printf '%s\n' "${SERVICES[@]}" | jq -R . | jq -s -c .)
+              echo "services=$JSON_ARRAY" >> $GITHUB_OUTPUT
+              echo "has_changes=true" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Print detected services
+        run: |
+          echo "🔍 감지된 서비스: ${{ steps.detect.outputs.services }}"
+          echo "📋 변경사항 존재: ${{ steps.detect.outputs.has_changes }}"
+
+  # ============================================================================
+  # 2️⃣ 빌드 및 배포 (매트릭스 전략)
+  # ============================================================================
+  build-and-deploy:
+    name: 🏗️ Build & Deploy
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(needs.detect-changes.outputs.services) }}
+    
+    env:
+      SERVICE: ${{ matrix.service }}
+      ENVIRONMENT: ${{ github.event.inputs.environment || 'demo' }}
+
+    steps:
+      # ========================================
+      # 초기 설정
+      # ========================================
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 전체 히스토리 (버전 추적용)
+
+      - name: 📋 Set deployment info
+        id: info
+        run: |
+          # 타임스탬프 및 버전 생성
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          VERSION="dev-${TIMESTAMP}-${SHORT_SHA}"
+          
+          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "commit_sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "repository_url=https://github.com/${{ github.repository }}" >> $GITHUB_OUTPUT
+          
+          # 배포 시작 시간 (나노초)
+          echo "started_at=$(date +%s%N)" >> $GITHUB_OUTPUT
+          
+          echo "📋 배포 정보:"
+          echo "   서비스: ${{ matrix.service }}"
+          echo "   버전: $VERSION"
+          echo "   환경: ${{ env.ENVIRONMENT }}"
+          echo "   커밋: $SHORT_SHA"
+
+      # ========================================
+      # AWS 인증 (OIDC)
+      # ========================================
+      - name: 🔐 Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: github-actions-deploy-${{ matrix.service }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🔑 Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ========================================
+      # 서비스별 설정
+      # ========================================
+      - name: ⚙️ Set service configuration
+        id: config
+        run: |
+          case "${{ matrix.service }}" in
+            "auth-python")
+              echo "dockerfile_path=./auth-python" >> $GITHUB_OUTPUT
+              echo "k8s_manifest=./infra/infra/k8s/auth-python.yaml" >> $GITHUB_OUTPUT
+              echo "container_port=8000" >> $GITHUB_OUTPUT
+              ;;
+            "chat-node")
+              echo "dockerfile_path=./chat-node" >> $GITHUB_OUTPUT
+              echo "k8s_manifest=./infra/infra/k8s/chat-node.yaml" >> $GITHUB_OUTPUT
+              echo "container_port=8080" >> $GITHUB_OUTPUT
+              ;;
+            "ranking-java")
+              echo "dockerfile_path=./ranking-java" >> $GITHUB_OUTPUT
+              echo "k8s_manifest=./infra/infra/k8s/ranking-java.yaml" >> $GITHUB_OUTPUT
+              echo "container_port=8081" >> $GITHUB_OUTPUT
+              ;;
+            "frontend-react")
+              echo "dockerfile_path=./frontend-react" >> $GITHUB_OUTPUT
+              echo "k8s_manifest=./infra/infra/k8s/frontend.yaml" >> $GITHUB_OUTPUT
+              echo "container_port=80" >> $GITHUB_OUTPUT
+              ;;
+            "api-gateway")
+              echo "dockerfile_path=./api-gateway" >> $GITHUB_OUTPUT
+              echo "k8s_manifest=./infra/infra/k8s/api-gateway.yaml" >> $GITHUB_OUTPUT
+              echo "container_port=8080" >> $GITHUB_OUTPUT
+              ;;
+            "load-generator")
+              echo "dockerfile_path=./load-generator" >> $GITHUB_OUTPUT
+              echo "k8s_manifest=./infra/infra/k8s/load-generator.yaml" >> $GITHUB_OUTPUT
+              echo "container_port=8000" >> $GITHUB_OUTPUT
+              ;;
+          esac
+          
+          # ECR 이미지 URI
+          ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          IMAGE_URI="${ECR_REGISTRY}/${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.service }}:${{ steps.info.outputs.version }}"
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "ecr_registry=$ECR_REGISTRY" >> $GITHUB_OUTPUT
+
+      # ========================================
+      # Kubernetes 매니페스트 업데이트
+      # ========================================
+      - name: 📝 Install yq
+        uses: mikefarah/yq@v4
+
+      - name: 🔧 Update Kubernetes manifest
+        id: manifest
+        run: |
+          MANIFEST="${{ steps.config.outputs.k8s_manifest }}"
+          
+          if [ ! -f "$MANIFEST" ]; then
+            echo "⚠️ 매니페스트 파일이 없습니다: $MANIFEST"
+            exit 0
+          fi
+          
+          echo "📝 매니페스트 업데이트 중: $MANIFEST"
+          
+          # 현재 버전 읽기
+          CURRENT_VERSION=$(yq eval 'select(.kind == "Deployment") | .metadata.labels."tags.datadoghq.com/version"' "$MANIFEST" 2>/dev/null || echo "0.1.0")
+          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          
+          # 버전 증가 (X.Y.Z 형식)
+          if [[ "$CURRENT_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            MAJOR="${BASH_REMATCH[1]}"
+            MINOR="${BASH_REMATCH[2]}"
+            PATCH="${BASH_REMATCH[3]}"
+            NEW_PATCH=$((PATCH + 1))
+            NEW_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
+          else
+            NEW_VERSION="0.1.1"
+          fi
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "🔼 버전 증가: $CURRENT_VERSION → $NEW_VERSION"
+          
+          # Deployment metadata.labels 버전 업데이트
+          yq eval "(select(.kind == \"Deployment\") | .metadata.labels.\"tags.datadoghq.com/version\") = \"$NEW_VERSION\"" -i "$MANIFEST"
+          
+          # Deployment spec.template.metadata.labels 버전 업데이트
+          yq eval "(select(.kind == \"Deployment\") | .spec.template.metadata.labels.\"tags.datadoghq.com/version\") = \"$NEW_VERSION\"" -i "$MANIFEST"
+          
+          # DD_GIT_COMMIT_SHA 환경변수 업데이트/추가
+          DD_GIT_SHA_EXISTS=$(yq eval 'select(.kind == "Deployment") | .spec.template.spec.containers[0].env[] | select(.name == "DD_GIT_COMMIT_SHA") | .name' "$MANIFEST" 2>/dev/null || echo "")
+          if [ -n "$DD_GIT_SHA_EXISTS" ]; then
+            yq eval "(select(.kind == \"Deployment\") | .spec.template.spec.containers[0].env[] | select(.name == \"DD_GIT_COMMIT_SHA\")) |= .value = \"${{ steps.info.outputs.commit_sha }}\"" -i "$MANIFEST"
+          else
+            yq eval "(select(.kind == \"Deployment\") | .spec.template.spec.containers[0].env) += [{\"name\": \"DD_GIT_COMMIT_SHA\", \"value\": \"${{ steps.info.outputs.commit_sha }}\"}]" -i "$MANIFEST"
+          fi
+          
+          # DD_GIT_REPOSITORY_URL 환경변수 업데이트/추가
+          DD_GIT_URL_EXISTS=$(yq eval 'select(.kind == "Deployment") | .spec.template.spec.containers[0].env[] | select(.name == "DD_GIT_REPOSITORY_URL") | .name' "$MANIFEST" 2>/dev/null || echo "")
+          if [ -n "$DD_GIT_URL_EXISTS" ]; then
+            yq eval "(select(.kind == \"Deployment\") | .spec.template.spec.containers[0].env[] | select(.name == \"DD_GIT_REPOSITORY_URL\")) |= .value = \"${{ steps.info.outputs.repository_url }}\"" -i "$MANIFEST"
+          else
+            yq eval "(select(.kind == \"Deployment\") | .spec.template.spec.containers[0].env) += [{\"name\": \"DD_GIT_REPOSITORY_URL\", \"value\": \"${{ steps.info.outputs.repository_url }}\"}]" -i "$MANIFEST"
+          fi
+          
+          echo "✅ 매니페스트 업데이트 완료!"
+
+      # ========================================
+      # Docker 빌드 (멀티아키텍처)
+      # ========================================
+      - name: 🐳 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 🔨 Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ steps.config.outputs.dockerfile_path }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.config.outputs.image_uri }}
+            ${{ steps.config.outputs.ecr_registry }}/${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.service }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+            ${{ matrix.service == 'frontend-react' && format('VITE_DD_RUM_APP_ID={0}', secrets.VITE_DD_RUM_APP_ID) || '' }}
+            ${{ matrix.service == 'frontend-react' && format('VITE_DD_RUM_CLIENT_TOKEN={0}', secrets.VITE_DD_RUM_CLIENT_TOKEN) || '' }}
+            ${{ matrix.service == 'frontend-react' && format('VITE_DD_SITE={0}', env.DD_SITE) || '' }}
+            ${{ matrix.service == 'frontend-react' && format('VITE_DD_ENV={0}', env.ENVIRONMENT) || '' }}
+            ${{ matrix.service == 'frontend-react' && format('VITE_APP_VERSION={0}', steps.manifest.outputs.new_version) || '' }}
+
+      # ========================================
+      # EKS 배포
+      # ========================================
+      - name: 🔧 Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: 🔗 Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }}
+
+      - name: 🚀 Deploy to EKS
+        id: deploy
+        run: |
+          MANIFEST="${{ steps.config.outputs.k8s_manifest }}"
+          DEPLOYMENT="${{ matrix.service }}"
+          IMAGE="${{ steps.config.outputs.image_uri }}"
+          
+          echo "📋 매니페스트 적용 중: $MANIFEST"
+          kubectl apply -f "$MANIFEST"
+          
+          echo "🔄 이미지 업데이트 중: $IMAGE"
+          kubectl set image deployment/$DEPLOYMENT $DEPLOYMENT=$IMAGE
+          
+          echo "⏳ 배포 완료 대기 중..."
+          kubectl rollout status deployment/$DEPLOYMENT --timeout=300s
+          
+          echo "✅ 배포 완료!"
+          
+          # 배포 종료 시간 기록
+          echo "finished_at=$(date +%s%N)" >> $GITHUB_OUTPUT
+
+      - name: 📊 Verify deployment
+        run: |
+          echo "📊 배포 상태 확인:"
+          kubectl get deployment ${{ matrix.service }} -o wide
+          echo ""
+          echo "🔍 Pod 상태:"
+          kubectl get pods -l app=${{ matrix.service }}
+
+      # ========================================
+      # 매니페스트 변경사항 커밋
+      # ========================================
+      - name: 💾 Commit manifest changes
+        if: success()
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          MANIFEST="${{ steps.config.outputs.k8s_manifest }}"
+          
+          if git diff --quiet "$MANIFEST"; then
+            echo "📋 매니페스트에 변경사항이 없습니다."
+          else
+            git add "$MANIFEST"
+            git commit -m "🤖 [CI] Update ${{ matrix.service }} manifest - v${{ steps.manifest.outputs.new_version }}
+            
+            - Version: ${{ steps.manifest.outputs.current_version }} → ${{ steps.manifest.outputs.new_version }}
+            - Commit: ${{ steps.info.outputs.short_sha }}
+            - Image: ${{ steps.config.outputs.image_uri }}"
+            
+            git push
+            echo "✅ 매니페스트 변경사항 커밋 완료!"
+          fi
+
+      # ========================================
+      # Datadog DORA Metrics
+      # ========================================
+      - name: 📈 Send Datadog DORA Metrics
+        if: always()
+        run: |
+          STARTED_AT="${{ steps.info.outputs.started_at }}"
+          FINISHED_AT="${{ steps.deploy.outputs.finished_at || $(date +%s%N) }}"
+          
+          # 배포 성공/실패 판단
+          if [ "${{ job.status }}" == "success" ]; then
+            STATUS="success"
+          else
+            STATUS="failure"
+          fi
+          
+          echo "📊 Datadog DORA Metrics 전송 중..."
+          echo "   서비스: ${{ matrix.service }}"
+          echo "   버전: ${{ steps.manifest.outputs.new_version }}"
+          echo "   상태: $STATUS"
+          
+          # DORA Deployment API 호출
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+            "https://api.${{ env.DD_SITE }}/api/v2/dora/deployment" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -H "DD-API-KEY: ${{ secrets.DD_API_KEY }}" \
+            -d @- << EOF
+          {
+            "data": {
+              "attributes": {
+                "started_at": ${STARTED_AT},
+                "finished_at": ${FINISHED_AT},
+                "service": "${{ matrix.service }}",
+                "version": "${{ steps.manifest.outputs.new_version }}",
+                "env": "${{ env.ENVIRONMENT }}",
+                "git": {
+                  "commit_sha": "${{ steps.info.outputs.commit_sha }}",
+                  "repository_url": "${{ steps.info.outputs.repository_url }}"
+                }
+              }
+            }
+          }
+          EOF
+          )
+          
+          HTTP_STATUS=$(echo "$RESPONSE" | grep "HTTP_STATUS" | cut -d: -f2)
+          
+          if [[ "$HTTP_STATUS" == "200" ]] || [[ "$HTTP_STATUS" == "201" ]] || [[ "$HTTP_STATUS" == "202" ]]; then
+            echo "✅ DORA Metrics 전송 성공!"
+          else
+            echo "⚠️ DORA Metrics 전송 실패 (HTTP: $HTTP_STATUS)"
+            echo "$RESPONSE"
+          fi
+
+      # ========================================
+      # Slack 알림
+      # ========================================
+      - name: 📢 Slack Notification
+        if: always()
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${{ job.status == 'success' && '✅' || '❌' }} ${{ matrix.service }} 배포 ${{ job.status == 'success' && '성공' || '실패' }}",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*서비스:*\n${{ matrix.service }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*환경:*\n${{ env.ENVIRONMENT }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*버전:*\n${{ steps.manifest.outputs.new_version }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*커밋:*\n<${{ steps.info.outputs.repository_url }}/commit/${{ github.sha }}|${{ steps.info.outputs.short_sha }}>"
+                    }
+                  ]
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "📋 <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|워크플로우 로그 보기>"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # ============================================================================
+  # 3️⃣ 배포 요약
+  # ============================================================================
+  summary:
+    name: 📊 Deployment Summary
+    needs: [detect-changes, build-and-deploy]
+    if: always() && needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📊 Print summary
+        run: |
+          echo "# 🚀 배포 요약" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 서비스 | 상태 |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|------|" >> $GITHUB_STEP_SUMMARY
+          
+          SERVICES='${{ needs.detect-changes.outputs.services }}'
+          for service in $(echo $SERVICES | jq -r '.[]'); do
+            echo "| $service | ✅ |" >> $GITHUB_STEP_SUMMARY
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📋 배포 정보" >> $GITHUB_STEP_SUMMARY
+          echo "- **브랜치:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **커밋:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **실행자:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **환경:** ${{ github.event.inputs.environment || 'demo' }}" >> $GITHUB_STEP_SUMMARY
+
