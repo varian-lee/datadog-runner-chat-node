@@ -316,7 +316,7 @@ async function connectWithRetry() {
 
           // 채팅 메시지만 로그 기록 (사용자 목록 업데이트 제외)
           if (data.type === 'chat') {
-            logger.info('채팅 메시지 브로드캐스트', {
+            logger.info('채팅 메시지 브로드캐스트!!', {
               user: data.user,
               clients: openConnections.length
             });
