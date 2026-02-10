@@ -143,7 +143,7 @@ jobs:
           echo "자동 롤백을 시작합니다..."
 
       - name: ⏪ Trigger rollback
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             await github.rest.actions.createWorkflowDispatch({
