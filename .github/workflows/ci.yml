@@ -10,15 +10,18 @@
 
 name: 🔍 CI - Pull Request
 
+# 🚫 임시 비활성화
+# on:
+#   pull_request:
+#     branches:
+#       - main
+#       - develop
+#     types:
+#       - opened
+#       - synchronize
+#       - reopened
 on:
-  pull_request:
-    branches:
-      - main
-      - develop
-    types:
-      - opened
-      - synchronize
-      - reopened
+  workflow_dispatch:  # 수동 실행만 허용
 
 env:
   AWS_REGION: ap-northeast-2

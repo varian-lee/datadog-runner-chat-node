@@ -4,25 +4,28 @@
 
 name: 🚀 Deploy
 
+# 🚫 임시 비활성화
+# on:
+#   workflow_dispatch:
+#     inputs:
+#       environment:
+#         description: '배포 환경'
+#         required: true
+#         type: choice
+#         default: 'demo'
+#         options:
+#           - demo
+#           - staging
+#           - production
+#
+#   push:
+#     branches:
+#       - main
+#     paths:
+#       - '*.js'
+#       - 'package.json'
 on:
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: '배포 환경'
-        required: true
-        type: choice
-        default: 'demo'
-        options:
-          - demo
-          - staging
-          - production
-
-  push:
-    branches:
-      - main
-    paths:
-      - '*.js'
-      - 'package.json'
+  workflow_dispatch:  # 수동 실행만 허용
       - 'package-lock.json'
       - 'Dockerfile'
 
